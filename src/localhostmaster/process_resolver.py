@@ -13,7 +13,9 @@ same process. To bound that risk without paying a full query every scan:
   reading only ``create_time`` (one cheap syscall). If it is unchanged the
   cached metadata is reused; if it changed the PID was recycled and a full
   resolve runs.
-* ``AccessDenied``/``NoSuchProcess`` degrade normally and never raise.
+* ``AccessDenied``/``NoSuchProcess`` degrade normally and never raise. A
+  ``DENIED`` PID reuses its cached metadata only within the TTL and is fully
+  re-resolved afterwards, so a permission change or PID recycle is picked up.
 
 Command lines are stored because classification may need them, but they are
 never logged or emitted.
@@ -103,18 +105,18 @@ class ProcessResolver:
         if cached is not None and seen_before and cached.fingerprint == fingerprint:
             state = cached.info.access_state
             if state not in (AccessState.GONE, AccessState.UNKNOWN):
-                if state == AccessState.DENIED:
-                    # create_time is unreadable for denied processes; accept the
-                    # cached metadata rather than re-querying every scan.
-                    cached.last_verified = now
-                    return cached.info
                 if (now - cached.last_verified) <= self.verify_ttl_s:
                     return cached.info
-                create_time = self._probe_create_time(pid)
-                if create_time is not None and create_time == cached.create_time:
-                    cached.last_verified = now
-                    return cached.info
-                # create_time changed (or became unreadable) -> full re-resolve.
+                # TTL expired. An OK entry is verified cheaply via create_time;
+                # a DENIED entry cannot expose create_time, so it goes straight
+                # to a full re-resolve (this is what stops a denied PID from
+                # keeping stale metadata forever).
+                if state != AccessState.DENIED:
+                    create_time = self._probe_create_time(pid)
+                    if create_time is not None and create_time == cached.create_time:
+                        cached.last_verified = now
+                        return cached.info
+                # create_time changed / unreadable, or DENIED -> full re-resolve.
 
         info = self._full_resolve(pid)
         self._cache[pid] = _CacheEntry(

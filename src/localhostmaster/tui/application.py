@@ -866,6 +866,7 @@ class LocalhostMasterApp:
             "",
         )
         rule_id = self._editing_rule.id if self._editing_rule else _slug_rule_id(name)
+        preserved = _preserved_rule_fields(self._editing_rule)
         rule = CategoryRule(
             id=rule_id,
             name=name,
@@ -878,6 +879,7 @@ class LocalhostMasterApp:
             scheme=scheme,
             open_in_browser=open_in_browser,
             source="user",
+            **preserved,
         )
         if self._editing_rule is not None:
             new_rules = [rule if r.id == rule_id else r for r in self.user_rules]
@@ -998,7 +1000,10 @@ class LocalhostMasterApp:
 
         @kb.add(Keys.Any, filter=Condition(lambda: app.mode == HELP))
         def _any_help(event) -> None:
-            if event.key in ("q", "c-c"):
+            # ``KeyPressEvent`` has no ``.key`` attribute; use ``.data`` (the
+            # printable character) to keep quit working even if the dedicated
+            # ``q`` / ``Ctrl-C`` bindings are ever shadowed.
+            if event.data in ("q", "\x03"):
                 event.app.exit()
             else:
                 app._return_to_main()
@@ -1075,6 +1080,31 @@ def _parse_ports(value: str) -> list[int]:
 
 def _has_control_chars(text: str) -> bool:
     return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+# Rule fields that the TUI form cannot represent. When editing an existing user
+# rule these must be carried over verbatim, otherwise saving (even just a colour
+# change) would silently destroy hand-written configuration.
+_PRESERVED_RULE_FIELDS = (
+    "port_ranges",
+    "executable_globs",
+    "command_line_globs",
+    "address_globs",
+    "container_name_globs",
+    "container_image_globs",
+    "exclude_process_globs",
+    "exclude_executable_globs",
+    "exclude_command_line_globs",
+    "exclude_ports",
+)
+
+
+def _preserved_rule_fields(base) -> dict:
+    if base is None:
+        return {}
+    preserved: dict = {name: list(getattr(base, name)) for name in _PRESERVED_RULE_FIELDS}
+    preserved["match_any_container"] = bool(base.match_any_container)
+    return preserved
 
 
 def _slug_rule_id(name: str) -> str:

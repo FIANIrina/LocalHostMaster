@@ -60,7 +60,8 @@ has been exercised (not 3.11).
   and `replace_user_rules()`; no more `classifier._user_rules` access.
 - **Startup scan deduplication** (`refresh.py`): the worker waits one interval
   before its first scan, so the synchronous pre-run scan is not repeated.
-- **Tests:** 177 passing (111 inherited + 66 new).
+- **Tests:** 185 passing (111 inherited + 74 new). A later adversarial bug
+  audit added 7 regression tests; see `report/know_bugs.md`.
 
 ### Completed (Phase 2) — [VERIFIED]
 
@@ -89,7 +90,7 @@ has been exercised (not 3.11).
 - **CLI** (`cli.py`): `--version --once --json --show-established --no-docker
   --config --refresh-ms --no-color --debug`; non-TTY auto-fallback to text;
   rotating debug log.
-- **Tests:** 177 tests, all passing as of Phase 3 (see §8).
+- **Tests:** 185 tests, all passing as of Phase 3 (see §8).
 - **Docs:** `README.md` (user-facing), this file (developer handover).
 
 ### In Progress
@@ -168,8 +169,12 @@ for connected TCP + LISTEN-only openability; bounded PID verification;
 offline local-install/console-entry verification; Docker once-mode confirmed
 and covered; config/input validation (refresh_ms floor, port bounds,
 http/https scheme, control-char names); public classifier API; and removal of
-the duplicate startup scan. Test count grew from 111 to 177. Still **no git
-commits** (user has not authorised one).
+the duplicate startup scan. Test count grew from 111 to 178. A subsequent
+adversarial bug audit (`report/know_bugs.md`) was then fixed: help-page key
+handler, TUI edit dropping advanced rule fields, DENIED cache never expiring,
+`--config` empty-name crash, atomic-write temp leakage, and worker/resolver
+restart. Total is now **185 tests**. Still **no git commits** (user has not
+authorised one).
 
 ---
 
@@ -324,8 +329,8 @@ Not applicable. This is a local developer tool; no deployment target exists.
 
 - **Framework:** standard library `unittest` (no pytest).
 - **Command:** `python -m unittest discover -s tests -v`
-- **Last result (Phase 3):** `Ran 177 tests` — **OK** (0 failures,
-  0 errors, 0 skipped). **[VERIFIED]**
+- **Last result (Phase 3 + bug-audit fixes):** `Ran 185 tests` — **OK**
+  (0 failures, 0 errors, 0 skipped). **[VERIFIED]**
 - **`python -m compileall src tests`:** OK. **[VERIFIED]**
 
 Added in Phase 3:

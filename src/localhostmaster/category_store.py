@@ -298,14 +298,16 @@ def atomic_write_text(path: Path, text: str) -> None:
     )
     tmp_name = handle.name
     try:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    try:
+        try:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            handle.close()
         os.replace(tmp_name, path)
-    except OSError:
+    except BaseException:
+        # Any failure (write/flush/fsync or os.replace) must not leave a
+        # ``*.tmp`` file behind. The previous file is still untouched.
         try:
             os.unlink(tmp_name)
         except OSError:

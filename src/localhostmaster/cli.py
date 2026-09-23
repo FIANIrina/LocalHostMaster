@@ -170,7 +170,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     categories_path = default_categories_path()
     if args.config is not None:
-        categories_path = Path(args.config).with_name("categories.toml")
+        try:
+            categories_path = Path(args.config).with_name("categories.toml")
+        except ValueError:
+            parser.error(f"--config path {str(args.config)!r} does not name a file")
     classifier, cat_warnings = _load_classifier(categories_path)
     warnings.extend(cat_warnings)
 

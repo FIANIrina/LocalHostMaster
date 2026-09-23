@@ -104,6 +104,9 @@ class RefreshWorker:
     def start(self) -> None:
         if self._thread is not None:
             return
+        # Allow a stopped worker to be restarted.
+        self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, name="lm-refresh", daemon=True)
         self._thread.start()
 

@@ -122,6 +122,8 @@ class DockerResolver:
     def start(self) -> None:
         if not self.enabled or self._thread is not None:
             return
+        # Allow a stopped resolver to be restarted.
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="docker-resolver", daemon=True)
         self._thread.start()
 
