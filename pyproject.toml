@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localhostmaster"
+version = "0.1.0"
+description = "Lightweight Windows TUI to inspect local listening ports and the processes behind them"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "LocalhostMaster" }]
+keywords = ["tui", "ports", "windows", "psutil", "prompt_toolkit"]
+dependencies = [
+    "psutil>=5.9",
+    "prompt_toolkit>=3.0",
+]
+
+[project.scripts]
+localhostmaster = "localhostmaster.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+localhostmaster = ["py.typed"]
