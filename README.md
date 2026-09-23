@@ -1,3 +1,5 @@
+English | [中文](README.zh-CN.md)
+
 # LocalhostMaster
 
 A lightweight Windows TUI for inspecting local listening ports and the
@@ -55,6 +57,9 @@ python -m venv .venv
 .venv\Scripts\localhostmaster --version     # localhostmaster 0.1.0
 ```
 
+> Offline: the build backend needs `setuptools`; pre-install it and pass
+> `--no-build-isolation` to complete the local install without network access.
+
 ### CLI options
 
 | Option | Meaning |
@@ -65,7 +70,7 @@ python -m venv .venv
 | `--show-established` | include non-listening TCP connections (ESTABLISHED, TIME_WAIT, …) and their remote endpoint |
 | `--no-docker` | disable Docker enrichment |
 | `--config PATH` | use an alternate `config.toml` |
-| `--refresh-ms N` | override the auto-refresh interval |
+| `--refresh-ms N` | override the auto-refresh interval (ms, minimum 250) |
 | `--no-color` | disable colours |
 | `--debug` | write rotating logs to `%LOCALAPPDATA%\LocalhostMaster\logs` |
 
