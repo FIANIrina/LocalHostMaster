@@ -81,10 +81,11 @@ table and exits instead of entering the full-screen UI.
 
 | Key | Action |
 | --- | --- |
-| `Up`/`Down`, `j`/`k` | move cursor |
+| `Up`/`Down` | move cursor |
 | `PageUp`/`PageDown` | page |
 | `Home`/`End` | first / last |
 | `Enter` | arm; press again within 2.5s to open in browser |
+| `k` | arm force-stop; press again within 2.5s to kill the process |
 | `Esc` | cancel confirmation / close dialog |
 | `r` | refresh now |
 | `Space` | pause / resume auto refresh |
@@ -97,6 +98,10 @@ table and exits instead of entering the full-screen UI.
 | `?` | help |
 | `q`, `Ctrl-C` | quit |
 
+`j`/`k` are still available as local navigation inside the filter, category and
+icon-picker lists, but the main port list uses `Up`/`Down` only, so `k` is
+unambiguous there.
+
 ### Double-Enter
 
 1. The first `Enter` only **arms** the selected endpoint; the status bar shows
@@ -108,7 +113,40 @@ table and exits instead of entering the full-screen UI.
 
 Only TCP **LISTEN** endpoints can be opened. Connected TCP rows (ESTABLISHED,
 TIME_WAIT, CLOSE_WAIT, …) and UDP rows show `-` in the OPEN column, never arm,
-and `Enter` only explains why they cannot be opened.
+and `Enter` only explains why they cannot be opened. The table adapts to the
+terminal width: on very narrow terminals the OPEN (and other) columns are
+omitted, while medium and wide terminals show OPEN.
+
+### Double-`k` force-stop
+
+The first `k` only **arms** the selected endpoint; the status bar shows
+`Press k again within 2.5s to force-stop …`. A second `k` between 150 ms and
+2500 ms submits the termination. Presses within the first 150 ms (keyboard
+auto-repeat) are ignored, and a press after 2.5 s starts a new confirmation.
+
+Safety rules:
+
+- It stops the **whole host process** behind the selected row, not just one
+  socket. Any *other* ports that process holds disappear with it, and the status
+  bar warns you how many other visible endpoints that affects.
+- It never kills a process tree, never terminates child processes and never
+  escalates privileges. Only `psutil.Process(pid).kill()` is used — no shell,
+  PowerShell, `taskkill` or `Stop-Process`.
+- Only **TCP LISTEN** and **UDP BOUND** rows can be force-stopped. Connected TCP
+  rows (ESTABLISHED, TIME_WAIT, …) and rows without a PID are refused.
+- The process identity (`PID` + creation time + endpoint) is re-verified right
+  before the kill, so a recycled PID is never hit; the selected endpoint is also
+  re-scanned to confirm it still belongs to that PID and is still listening.
+- LocalhostMaster itself, PID 0, PID 4, Windows core/service processes and
+  Docker host proxies (`com.docker.backend`, `wslrelay`, `dockerd`, `docker`)
+  are always refused.
+- When `create_time` cannot be read, the target is refused rather than killed
+  unverified.
+- Termination runs on a background thread, so the UI never blocks, and the port
+  list is refreshed as soon as it finishes.
+- The result distinguishes **exited** from **request sent but exit not
+  confirmed** (`Force-stop was requested, but exit was not confirmed.`). An
+  `AccessDenied` result is a normal permission limit, not a bug.
 
 ## URL rules
 
@@ -154,6 +192,10 @@ Precedence: CLI flags > user config > built-in defaults.
 `refresh_ms` is clamped to a minimum of 250 ms (with a warning) so a bad config
 cannot create a busy loop; `--refresh-ms` below 250 is rejected with an error.
 `docker_timeout_s` and `docker_ttl_s` are likewise clamped to positive values.
+`arm_guard_ms` is clamped to at most half of `double_enter_ms` (with a warning),
+otherwise the auto-repeat guard would swallow every second press and
+double-Enter / double-`k` could never fire. An unknown `color_mode` falls back to
+`auto` with a warning.
 
 ### `categories.toml`
 
@@ -165,7 +207,7 @@ cannot create a busy loop; `--refresh-ms` below 250 is rejected with an error.
 id = "user.my-llama"
 name = "my-llama"
 color = "#7C3AED"
-icon = "L"
+icon = "◆"
 priority = 120
 open_in_browser = true
 scheme = "http"
@@ -180,6 +222,10 @@ ports = [3000]
 port_ranges = ["3001-3010"]
 protocols = ["TCP"]
 ```
+
+`icon` is chosen from a small preset list in the UI (see **Category icons**
+below) and stored as the literal glyph. The file format is unchanged, so
+hand-written `icon` values keep working.
 
 Matching rules:
 
@@ -211,6 +257,29 @@ overwritten automatically.
 Categories are always shown as **text**; colour is never the only signal. In
 `none`/`NO_COLOR`/`--no-color` mode, Unicode icons fall back to ASCII.
 
+## Category icons
+
+The category form no longer accepts free-text icon input. The **Icon** field is
+a read-only selector: press `Enter` or `Space` to open a picker that lists every
+preset with its actual glyph and a readable name (for example `◆  Diamond`).
+`Up`/`Down` (or `j`/`k`) move, `Enter`/`Space` choose, and `Esc` returns to the
+form without changing anything.
+
+- New and edited categories must use a preset icon; the default is `◆ Diamond`.
+- Presets are single-width symbols that render reliably in Windows Terminal:
+  `◆`, `▣`, `▤`, `▸`, `•`, `·`, `●`, `■`, `▲`, `★`, `◇`, `□`, `○`, `◉`, `⬢`, `✦`.
+- The chosen glyph is only written to `categories.toml` when you **save** the
+  form; cancelling changes nothing.
+- Existing hand-written icons keep working. An icon that is not in the preset
+  list shows as `Legacy/custom` in the form and is preserved unless you actively
+  pick a preset; in ASCII-only mode it falls back to `*`. Unknown glyphs never
+  break loading.
+
+The **Color** field must be a prompt_toolkit colour name (for example `red` or
+`ansiblue`) or `#RGB`/`#RRGGBB`. An invalid value is rejected by the form; a bad
+colour already on disk never prevents the UI from starting (it falls back to the
+default grey).
+
 ## Permissions
 
 - Works as a normal user; no elevation is required.
@@ -241,7 +310,9 @@ python -m compileall src
 ```
 
 Tests use dependency injection and fakes: they never open a real browser and
-only bind temporary loopback sockets on random ports.
+only bind temporary loopback sockets on random ports. Force-stop is tested with
+an injected fake terminator, so **no automated test ever terminates a real
+process**.
 
 ## Performance
 
@@ -278,6 +349,11 @@ previous one; there is no incremental scanning.
 - PID identity is re-verified every ~45 s (and whenever a PID's endpoint set
   changes); a process killed and recycled with an identical PID between two
   verifications could still briefly show stale metadata.
+- Force-stop cannot be atomic: the endpoint and identity are re-checked
+  immediately before the kill, which shrinks — but cannot fully eliminate — the
+  window between verification and `TerminateProcess`.
+- Docker host proxies are deliberately refused, so a container's published port
+  cannot be stopped from LocalhostMaster (use `docker stop` for that).
 - A standalone `.exe` is not produced by default (no bundler is installed or
   required).
 
@@ -297,8 +373,11 @@ src/localhostmaster/
   clipboard.py           Win32 Unicode clipboard
   refresh.py             snapshot builder + background refresh worker
   state.py               double-Enter state machine, sort/filter/selection
+  kill_state.py          double-k force-stop state machine
+  process_terminator.py  safe psutil kill boundary (policy + re-verification)
+  icons.py               central preset icon registry
   tui/                   prompt_toolkit application, controls, styles
-tests/                   unittest suite (fakes, no real browser/terminal)
+tests/                   unittest suite (fakes, no real browser/terminal/kill)
 ```
 
 ## License

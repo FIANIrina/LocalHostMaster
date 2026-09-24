@@ -14,6 +14,7 @@ import os
 import re
 from typing import Iterable, Optional
 
+from .icons import glyph_for_id
 from .models import (
     AddressFamily,
     CategoryAssignment,
@@ -36,7 +37,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.llama.cpp",
             name="llama.cpp",
             color="#7C3AED",
-            icon="\u25c6",
+            icon=glyph_for_id("diamond"),
             priority=100,
             process_globs=["llama-server*", "llama-cli*", "llamafile*"],
             scheme="http",
@@ -46,7 +47,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.docker",
             name="docker",
             color="#2563EB",
-            icon="\u25a3",
+            icon=glyph_for_id("square_marked"),
             priority=95,
             process_globs=[
                 "com.docker.backend*",
@@ -61,7 +62,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.docker.container",
             name="docker",
             color="#2563EB",
-            icon="\u25a3",
+            icon=glyph_for_id("square_marked"),
             priority=94,
             match_any_container=True,
             scheme="http",
@@ -71,7 +72,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.database",
             name="database",
             color="#EA580C",
-            icon="\u25a4",
+            icon=glyph_for_id("square_striped"),
             priority=60,
             process_globs=[
                 "postgres*",
@@ -87,7 +88,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.dev-server",
             name="dev-server",
             color="#16A34A",
-            icon="\u25b8",
+            icon=glyph_for_id("play_small"),
             priority=50,
             process_globs=[
                 "node*",
@@ -106,7 +107,7 @@ def builtin_rules() -> list[CategoryRule]:
             id="builtin.system",
             name="system",
             color="#6B7280",
-            icon="\u2022",
+            icon=glyph_for_id("bullet"),
             priority=10,
             process_globs=[
                 "svchost*",
@@ -221,7 +222,7 @@ class Classifier:
         return CategoryAssignment(
             name=UNKNOWN_NAME,
             color=UNKNOWN_COLOR,
-            icon="\u00b7",
+            icon=glyph_for_id("dot"),
             scheme="",
             open_in_browser=True,
             source="fallback",

@@ -22,9 +22,15 @@ CREATE_NO_WINDOW = 0x08000000
 
 _PORT_RE = re.compile(
     r"(?:(?P<host>\[[^\]]+\]|[0-9a-fA-F:.]+):)?"
-    r"(?P<hostport>\d+)->(?P<cport>\d+)/(?P<proto>tcp|udp)"
+    r"(?P<hostport>\d+)(?:-(?P<hostport_hi>\d+))?"
+    r"->"
+    r"(?P<cport>\d+)(?:-(?P<cport_hi>\d+))?"
+    r"/(?P<proto>tcp|udp)"
 )
 _LABEL_PORT_RE = re.compile(r"^desktop\.docker\.io/ports/(?P<cport>\d+)/(?P<proto>tcp|udp)$")
+
+# A published mapping can never legitimately span more than the port space.
+_MAX_RANGE = 65536
 
 
 def _normalize_host(host: str) -> str:
@@ -36,17 +42,50 @@ def _normalize_host(host: str) -> str:
     return host
 
 
+def _int_or_none(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_ports_string(ports: str) -> list[tuple[str, int, int, Protocol]]:
     out: list[tuple[str, int, int, Protocol]] = []
     for match in _PORT_RE.finditer(ports or ""):
         host = _normalize_host(match.group("host") or "")
         proto = Protocol.TCP if match.group("proto") == "tcp" else Protocol.UDP
-        out.append((host, int(match.group("hostport")), int(match.group("cport")), proto))
+        h_lo = int(match.group("hostport"))
+        h_hi = int(match.group("hostport_hi") or h_lo)
+        c_lo = int(match.group("cport"))
+        c_hi = int(match.group("cport_hi") or c_lo)
+        if h_hi < h_lo:
+            h_lo, h_hi = h_hi, h_lo
+        if c_hi < c_lo:
+            c_lo, c_hi = c_hi, c_lo
+        if h_hi - h_lo >= _MAX_RANGE or c_hi - c_lo >= _MAX_RANGE:
+            continue
+        host_ports = list(range(h_lo, h_hi + 1))
+        container_ports = list(range(c_lo, c_hi + 1))
+        if len(host_ports) == len(container_ports):
+            pairs = zip(host_ports, container_ports)
+        elif len(container_ports) == 1:
+            pairs = ((h, c_lo) for h in host_ports)
+        elif len(host_ports) == 1:
+            pairs = ((h_lo, c) for c in container_ports)
+        else:
+            pairs = zip(host_ports, container_ports)
+        for host_port, container_port in pairs:
+            out.append((host, host_port, container_port, proto))
     return out
 
 
 def parse_labels_for_ports(labels: str) -> dict[tuple[int, Protocol], str]:
-    """Extract ``{ (container_port, proto): host_port }`` from Docker labels."""
+    """Extract ``{ (container_port, proto): host_port }`` from Docker labels.
+
+    Values may carry an optional host prefix (``127.0.0.1:8080``); only the
+    final ``:``-separated segment is used, and non-numeric values are skipped so
+    a malformed label can never crash the Docker thread.
+    """
     found: dict[tuple[int, Protocol], str] = {}
     for item in (labels or "").split(","):
         key, _, value = item.partition("=")
@@ -54,8 +93,10 @@ def parse_labels_for_ports(labels: str) -> dict[tuple[int, Protocol], str]:
         if not match:
             continue
         proto = Protocol.TCP if match.group("proto") == "tcp" else Protocol.UDP
-        host_port = value.strip().lstrip(":")
-        if host_port:
+        host_port = value.strip()
+        if ":" in host_port:
+            host_port = host_port.rsplit(":", 1)[1].strip()
+        if host_port.isdigit():
             found[(int(match.group("cport")), proto)] = host_port
     return found
 
@@ -82,7 +123,10 @@ def parse_docker_ps_output(output: str) -> list[ContainerInfo]:
         mappings = parse_ports_string(ports)
         if not mappings:
             for (cport, proto), host_port in parse_labels_for_ports(labels).items():
-                mappings.append(("", int(host_port), cport, proto))
+                host_port_int = _int_or_none(host_port)
+                if host_port_int is None:
+                    continue
+                mappings.append(("", host_port_int, cport, proto))
 
         for host, host_port, cport, proto in mappings:
             containers.append(
@@ -136,7 +180,12 @@ class DockerResolver:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.refresh_once()
+            try:
+                self.refresh_once()
+            except Exception as exc:  # pragma: no cover - defensive
+                # The enrichment thread must never die on malformed output.
+                with self._lock:
+                    self._last_error = type(exc).__name__
             self._stop.wait(self.ttl_s)
 
     def refresh_once(self) -> None:
@@ -148,7 +197,14 @@ class DockerResolver:
             with self._lock:
                 self._last_error = type(exc).__name__
             return
-        mappings = parse_docker_ps_output(output)
+        try:
+            mappings = parse_docker_ps_output(output)
+        except Exception as exc:
+            # Parsing is best-effort; a bad payload must not crash the caller
+            # (interactive thread or the non-interactive CLI scan).
+            with self._lock:
+                self._last_error = type(exc).__name__
+            return
         with self._lock:
             self._mappings = mappings
             self._last_ok = time.monotonic()

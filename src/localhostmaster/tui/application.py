@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from typing import Callable, Optional
 
@@ -24,7 +26,30 @@ from prompt_toolkit.widgets import Button, Label, TextArea
 
 from .. import __version__
 from ..config import AppConfig, default_categories_path
-from ..models import EndpointKey, PortEntry, Protocol, Snapshot
+from ..icons import (
+    LEGACY_ASCII_FALLBACK,
+    default_icon,
+    icon_by_glyph,
+    is_preset_glyph,
+    preset_icons,
+    render_glyph,
+)
+from ..kill_state import KillArmController, KillDecision
+from ..models import (
+    KILL_GUARD_S,
+    KILL_TIMEOUT_S,
+    EndpointKey,
+    PortEntry,
+    ProcessIdentity,
+    Protocol,
+    Snapshot,
+)
+from ..process_terminator import (
+    LISTENER_STATES,
+    TerminationResult,
+    TerminationStatus,
+    protected_reason,
+)
 from ..state import (
     ArmDecision,
     OpenArmController,
@@ -41,6 +66,7 @@ from .styles import (
     build_style_dict,
     category_style_name,
     color_depth_for,
+    is_valid_color,
     resolve_color_mode,
 )
 
@@ -50,30 +76,36 @@ SEARCH = "search"
 FILTER = "filter"
 CATEGORIES = "categories"
 FORM = "category_form"
+ICON_PICKER = "icon_picker"
 EDIT_MODES = {SEARCH, FORM}
 
 HELP_TEXT = [
     ("class:lm.header", "LocalhostMaster - help\n\n"),
     ("class:lm.dim", "Navigation\n"),
-    ("", "  Up/Down, j/k        move cursor\n"),
+    ("", "  Up/Down             move cursor\n"),
     ("", "  PageUp/PageDown     page\n"),
     ("", "  Home/End            first / last\n\n"),
     ("class:lm.dim", "Actions\n"),
     ("", "  Enter               arm; press again within 2.5s to open\n"),
+    ("", "  k                   arm; press again within 2.5s to force-stop\n"),
+    ("", "                      the whole process behind the selected port\n"),
     ("", "  Esc                 cancel confirmation / close dialog\n"),
     ("", "  r                   refresh now\n"),
     ("", "  Space               pause / resume auto refresh\n"),
     ("", "  /                   search\n"),
-    ("", "  f                   filter\n"),
+    ("", "  f                   filter (j/k move, Enter apply)\n"),
     ("", "  s                   cycle sort (port/process/category/pid)\n"),
     ("", "  a                   toggle established TCP connections\n"),
     ("", "  c                   copy URL of selected TCP endpoint\n"),
-    ("", "  C                   manage categories\n"),
+    ("", "  C                   manage categories (j/k move)\n"),
     ("", "  ?                   this help\n"),
     ("", "  q / Ctrl-C          quit\n\n"),
     ("class:lm.dim", "Notes\n"),
     ("", "  Only TCP endpoints can be opened in a browser.\n"),
-    ("", "  IPv6 URLs use brackets, e.g. http://[::1]:8080/\n"),
+    ("", "  Force-stop only accepts TCP LISTEN / UDP BOUND rows and only\n"),
+    ("", "  stops the single host process shown; it never kills a process\n"),
+    ("", "  tree. LocalhostMaster itself, PID 0, PID 4, Windows core\n"),
+    ("", "  processes and Docker host proxies are refused.\n"),
     ("", "  Wildcard bind addresses map to 127.0.0.1 / [::1].\n"),
     ("", "  A category is always shown as text; colour is not the only signal.\n\n"),
     ("class:lm.hint", "Press any key to return."),
@@ -95,6 +127,7 @@ class LocalhostMasterApp:
         user_rules=None,
         warnings: Optional[list[str]] = None,
         no_color: bool = False,
+        terminator=None,
     ) -> None:
         self.config = config
         self.classifier = classifier
@@ -102,6 +135,9 @@ class LocalhostMasterApp:
         self.docker = docker
         self.opener = opener
         self.clipboard = clipboard
+        # Injected from the production CLI. ``None`` disables real termination
+        # entirely, so constructing an app in a test never arms a real kill.
+        self.terminator = terminator
         self.categories_path = categories_path or default_categories_path()
         self.user_rules = list(user_rules or [])
         self.warnings = list(warnings or [])
@@ -127,11 +163,22 @@ class LocalhostMasterApp:
         self._editing_rule = None
         self._form_fields: dict[str, TextArea] = {}
         self._form_buttons: list[Button] = []
+        self._form_root = None
+        self._form_icon_glyph = ""
+        self._form_icon_original = ""
+        self._form_icon_is_legacy = False
+        self._icon_picker_cursor = 0
 
         self.arm = OpenArmController(
             guard_s=max(0.0, config.arm_guard_ms / 1000.0),
             timeout_s=max(0.1, config.double_enter_ms / 1000.0),
         )
+        # Fixed (not user-configurable) timing for the destructive double-k.
+        self.kill_arm = KillArmController(guard_s=KILL_GUARD_S, timeout_s=KILL_TIMEOUT_S)
+        self.kill_in_progress = False
+        self._kill_target: Optional[ProcessIdentity] = None
+        self._kill_thread: Optional[threading.Thread] = None
+        self._kill_stop = threading.Event()
         self.notice: Optional[tuple[str, str, float]] = None
         self._paused = False
         self._last_generation = -1
@@ -172,6 +219,12 @@ class LocalhostMasterApp:
         self.app.run()
 
     def shutdown(self) -> None:
+        # Stop accepting kill callbacks, then let the worker end.
+        self._kill_stop.set()
+        kill_thread = self._kill_thread
+        if kill_thread is not None and kill_thread.is_alive():
+            kill_thread.join(timeout=2.0)
+        self._kill_thread = None
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
@@ -239,10 +292,15 @@ class LocalhostMasterApp:
         self._all_entries = sort_entries(snapshot.entries, self.sort_mode)
 
         present = {}
+        kill_present = {}
         for entry in self._all_entries:
             if is_openable(entry):
                 present[entry.key] = url_for_entry(entry)
+            identity = self._identity_for(entry)
+            if identity is not None:
+                kill_present[entry.key] = identity
         self.arm.reconcile(present)
+        self.kill_arm.reconcile(kill_present)
 
         self._recompute_view()
         if snapshot.error:
@@ -327,6 +385,39 @@ class LocalhostMasterApp:
         return text + "\n"
 
     def _render_status(self):
+        if self.kill_in_progress and self._kill_target is not None:
+            target = self._kill_target
+            return [
+                (
+                    "class:lm.status.notice",
+                    f" Force-stopping {target.process_name} (PID {target.pid})\u2026",
+                )
+            ]
+        if self.arm.is_armed and self.arm.armed is not None:
+            remaining = self.arm.remaining()
+            return [
+                (
+                    "class:lm.status.notice",
+                    f" Press Enter again within {remaining:.1f}s to open {self.arm.armed.url}",
+                )
+            ]
+        if self.kill_arm.is_armed:
+            target = self.kill_arm.target()
+            if target is not None:
+                remaining = self.kill_arm.remaining()
+                key = target.endpoint_key
+                text = (
+                    f" Press k again within {remaining:.1f}s to force-stop "
+                    f"{target.process_name} (PID {target.pid})"
+                    f" \u00b7 {key.protocol.value} {key.local_address}:{key.port}"
+                )
+                others = self._other_endpoint_count(target)
+                if others > 0:
+                    text += (
+                        f" \u00b7 stopping this process may also close "
+                        f"{others} other visible endpoint(s)"
+                    )
+                return [("class:lm.status.notice", text)]
         notice = self._active_notice()
         if notice is not None:
             text, kind = notice
@@ -336,22 +427,14 @@ class LocalhostMasterApp:
                 "info": "class:lm.status.notice",
             }.get(kind, "class:lm.status.notice")
             return [(style, f" {text}")]
-        if self.arm.is_armed and self.arm.armed is not None:
-            remaining = self.arm.remaining()
-            return [
-                (
-                    "class:lm.status.notice",
-                    f" Press Enter again within {remaining:.1f}s to open {self.arm.armed.url}",
-                )
-            ]
         if self.warnings:
             return [("class:lm.status.error", f" {self.warnings[0]}")]
         return [("class:lm.dim", " Ready. Press ? for help, q to quit.")]
 
     def _render_hint(self):
         return (
-            " [\u2191\u2193] move  [Enter] open  [r] refresh  [Space] pause  [/] search"
-            "  [f] filter  [s] sort  [a] conns  [c] copy  [C] categories  [?] help  [q] quit"
+            " [\u2191\u2193] move  [Enter Enter] open  [k k] force-stop  [r] refresh  [Space] pause"
+            "  [/] search  [f] filter  [s] sort  [a] conns  [c] copy  [C] categories"
         )
 
     # ---------------------------------------------------------------- notices
@@ -389,7 +472,7 @@ class LocalhostMasterApp:
             return
         self.cursor = clamp_cursor(self.cursor + delta, len(self.view))
         self._cursor_key = self.view[self.cursor].key
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._invalidate()
 
     def _move_to(self, index: int) -> None:
@@ -397,12 +480,21 @@ class LocalhostMasterApp:
             return
         self.cursor = clamp_cursor(index, len(self.view))
         self._cursor_key = self.view[self.cursor].key
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._invalidate()
 
     def _cancel_arm(self) -> None:
         if self.arm.is_armed:
             self.arm.cancel()
+
+    def _cancel_kill_arm(self) -> None:
+        if self.kill_arm.is_armed:
+            self.kill_arm.cancel()
+
+    def _cancel_confirmations(self) -> None:
+        """Cancel both confirmation states (used by navigation/mode switches)."""
+        self._cancel_arm()
+        self._cancel_kill_arm()
 
     # ------------------------------------------------------------- key actions
     def _handle_enter(self) -> None:
@@ -422,6 +514,7 @@ class LocalhostMasterApp:
             self._invalidate()
             return
         if decision == ArmDecision.ARMED:
+            self._cancel_kill_arm()
             self._set_notice(
                 f"Press Enter again within {self.config.double_enter_ms / 1000:.1f}s to open {url}",
                 "info",
@@ -456,13 +549,13 @@ class LocalhostMasterApp:
     def _toggle_sort(self) -> None:
         self.sort_mode = next_sort_mode(self.sort_mode)
         self._all_entries = sort_entries(self._all_entries, self.sort_mode)
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._recompute_view()
         self._invalidate()
 
     def _toggle_established(self) -> None:
         self.show_established = not self.show_established
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._set_notice(
             "Showing established connections" if self.show_established else "Hiding established connections",
             "info",
@@ -482,6 +575,129 @@ class LocalhostMasterApp:
         if self.worker is not None:
             self.worker.trigger()
         self._invalidate()
+
+    # -------------------------------------------------------- kill (double k)
+    def _identity_for(self, entry: Optional[PortEntry]) -> Optional[ProcessIdentity]:
+        if entry is None or entry.pid is None or entry.process is None:
+            return None
+        if entry.process.create_time is None:
+            return None
+        return ProcessIdentity(
+            pid=entry.pid,
+            create_time=float(entry.process.create_time),
+            endpoint_key=entry.key,
+            process_name=entry.process_name,
+            has_container_mapping=entry.container is not None,
+        )
+
+    def _other_endpoint_count(self, identity: Optional[ProcessIdentity]) -> int:
+        if identity is None:
+            return 0
+        count = 0
+        # "visible" in the status hint means the currently filtered/searched
+        # view, not every scanned entry.
+        for entry in self.view:
+            if entry.key == identity.endpoint_key:
+                continue
+            if entry.pid == identity.pid:
+                count += 1
+        return count
+
+    def _kill_eligibility_reason(self, entry: PortEntry) -> Optional[str]:
+        """Lightweight, read-only precheck for the first ``k``."""
+        if self.terminator is None:
+            return "force-stop is not available in this session"
+        if entry.pid is None:
+            return "this endpoint has no process (PID unknown)"
+        if entry.socket_state not in LISTENER_STATES:
+            return "only listening (TCP) or bound (UDP) endpoints can be force-stopped"
+        if entry.process is None:
+            return "process metadata is unavailable"
+        if entry.process.create_time is None:
+            return "process creation time is unavailable; refusing an unverified target"
+        return protected_reason(
+            pid=entry.pid,
+            name=entry.process_name,
+            username=entry.process.username,
+            self_pid=os.getpid(),
+            has_container_mapping=entry.container is not None,
+        )
+
+    def _handle_kill(self) -> None:
+        if self.kill_in_progress:
+            self._set_notice("A force-stop is already in progress", "info")
+            return
+        entry = self._current_entry()
+        if entry is None:
+            return
+        reason = self._kill_eligibility_reason(entry)
+        if reason is not None:
+            self._cancel_kill_arm()
+            self._set_notice(f"Cannot force-stop: {reason}", "error")
+            self._invalidate()
+            return
+        identity = self._identity_for(entry)
+        if identity is None:
+            self._cancel_kill_arm()
+            self._set_notice("Cannot force-stop: process identity is unavailable", "error")
+            self._invalidate()
+            return
+        decision = self.kill_arm.press(identity)
+        if decision == KillDecision.IGNORED:
+            self._invalidate()
+            return
+        if decision == KillDecision.ARMED:
+            # Kill and open confirmations are mutually exclusive.
+            self._cancel_arm()
+            self._invalidate()
+            return
+        self._submit_kill(identity)
+
+    def _submit_kill(self, identity: ProcessIdentity) -> None:
+        self.kill_in_progress = True
+        self._kill_target = identity
+        self._kill_stop.clear()
+        self._start_kill_thread(identity)
+        self._invalidate()
+
+    def _start_kill_thread(self, identity: ProcessIdentity) -> None:
+        terminator = self.terminator
+
+        def run() -> None:
+            try:
+                result = terminator.force_stop(identity)
+            except Exception:
+                result = TerminationResult(
+                    TerminationStatus.UNEXPECTED_ERROR,
+                    "The force-stop request failed unexpectedly.",
+                    identity.pid,
+                )
+            self._schedule(lambda: self._on_kill_done(identity, result))
+
+        thread = threading.Thread(target=run, name="lm-kill", daemon=True)
+        self._kill_thread = thread
+        thread.start()
+
+    def _on_kill_done(self, identity: ProcessIdentity, result: TerminationResult) -> None:
+        if self._kill_stop.is_set():
+            # Application is shutting down; do not touch a closed TUI.
+            return
+        self.kill_in_progress = False
+        self._kill_target = None
+        if result.status in (
+            TerminationStatus.EXITED,
+        ):
+            kind = "ok"
+        elif result.status in (
+            TerminationStatus.ALREADY_GONE,
+            TerminationStatus.UNCONFIRMED,
+        ):
+            kind = "info"
+        else:
+            kind = "error"
+        self._set_notice(result.message, kind)
+        # Reflect reality immediately, whatever the outcome.
+        self._trigger_refresh()
 
     # ------------------------------------------------------------------ modes
     def _switch_mode(self, mode: str, root, focus=None) -> None:
@@ -510,6 +726,7 @@ class LocalhostMasterApp:
         self._invalidate()
 
     def _open_help(self) -> None:
+        self._cancel_confirmations()
         root = HSplit(
             [
                 Window(FormattedTextControl(HELP_TEXT), wrap_lines=True),
@@ -530,7 +747,7 @@ class LocalhostMasterApp:
         @kb.add("enter")
         def _accept(event) -> None:
             self.search_query = self._search_area.text
-            self._cancel_arm()
+            self._cancel_confirmations()
             self._recompute_view()
             self._return_to_main()
 
@@ -555,7 +772,7 @@ class LocalhostMasterApp:
 
     def _open_search(self) -> None:
         root = self._build_search_root()
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._switch_mode(SEARCH, root, focus=self._search_area)
 
     # ---------------------------------------------------------------- filter
@@ -587,6 +804,7 @@ class LocalhostMasterApp:
 
     def _open_filter(self) -> None:
         self.filter_cursor = 0
+        self._cancel_confirmations()
         self._switch_mode(FILTER, self._build_filter_root(), focus=self._filter_control)
 
     def _filter_move(self, delta: int) -> None:
@@ -598,7 +816,7 @@ class LocalhostMasterApp:
         options = self._filter_options()
         if 0 <= self.filter_cursor < len(options):
             self.filter_spec = options[self.filter_cursor]
-        self._cancel_arm()
+        self._cancel_confirmations()
         self._recompute_view()
         self._return_to_main()
 
@@ -641,7 +859,13 @@ class LocalhostMasterApp:
             if rule.match_any_container:
                 range_bits.append("any-container")
             detail = " ".join(range_bits)
-            lines.append((style, f"{marker}{rule.name:<16} {tag:<10} prio={rule.priority:<4} {detail}\n"))
+            icon = render_glyph(rule.icon, self.ascii_only) or LEGACY_ASCII_FALLBACK
+            lines.append(
+                (
+                    style,
+                    f"{marker}{icon} {rule.name:<16} {tag:<10} prio={rule.priority:<4} {detail}\n",
+                )
+            )
         lines.append(
             (
                 "class:lm.hint",
@@ -659,6 +883,7 @@ class LocalhostMasterApp:
 
     def _open_categories(self) -> None:
         self.category_cursor = 0
+        self._cancel_confirmations()
         self._switch_mode(CATEGORIES, self._build_categories_root(), focus=self._category_control)
 
     def _selected_category_rule(self):
@@ -672,7 +897,7 @@ class LocalhostMasterApp:
         prefill = {
             "name": "",
             "color": "#7C3AED",
-            "icon": "",
+            "icon": default_icon().glyph,
             "priority": "50",
             "process_globs": "",
             "ports": "",
@@ -727,18 +952,25 @@ class LocalhostMasterApp:
             self._invalidate()
             return
         self._category_delete_confirm = False
-        remaining = [r for r in self.user_rules if r.id != rule.id]
+        # Remove by object identity: two hand-written rules may share an id, and
+        # deleting one must not silently delete the other.
+        remaining = [r for r in self.user_rules if r is not rule]
         if self._commit_user_rules(remaining):
             self._set_notice(f"Deleted category {rule.name}", "ok")
             self._switch_mode(CATEGORIES, self._build_categories_root(), focus=self._category_control)
 
+    def _cancel_category_delete_confirm(self) -> None:
+        if self._category_delete_confirm:
+            self._category_delete_confirm = False
+            self._invalidate()
+
     # -------------------------------------------------------------- form
     def _open_form(self, prefill: dict, title: str) -> None:
+        self._cancel_confirmations()
         self._form_title = title
         fields = [
             ("name", "Name", True),
             ("color", "Color", False),
-            ("icon", "Icon", False),
             ("priority", "Priority", False),
             ("process_globs", "Process globs", False),
             ("ports", "Ports/ranges", False),
@@ -746,6 +978,14 @@ class LocalhostMasterApp:
             ("scheme", "Scheme", False),
             ("open_in_browser", "Open in browser", False),
         ]
+        raw_icon = (prefill.get("icon", "") or "").strip()
+        if not raw_icon:
+            # A category always has an icon; default to a preset for new rules
+            # and for rules whose stored icon is empty.
+            raw_icon = default_icon().glyph
+        self._form_icon_glyph = raw_icon
+        self._form_icon_original = raw_icon
+        self._form_icon_is_legacy = not is_preset_glyph(raw_icon)
         self._form_fields = {}
         rows = [
             Window(
@@ -774,6 +1014,34 @@ class LocalhostMasterApp:
         def _accept(event) -> None:
             focus_next(event)
 
+        # The icon field is a read-only selector, not a free-text input.
+        icon_kb = KeyBindings()
+
+        @icon_kb.add("enter")
+        @icon_kb.add("space")
+        def _choose_icon(event) -> None:
+            self._open_icon_picker()
+
+        @icon_kb.add("tab")
+        @icon_kb.add("down")
+        def _icon_next(event) -> None:
+            focus_next(event)
+
+        @icon_kb.add("s-tab")
+        @icon_kb.add("up")
+        def _icon_prev(event) -> None:
+            focus_previous(event)
+
+        @icon_kb.add("escape")
+        @icon_kb.add("c-c")
+        def _icon_cancel(event) -> None:
+            self._return_to_categories()
+
+        self._icon_control = FormattedTextControl(
+            self._render_icon_field, focusable=True, show_cursor=False
+        )
+        self._icon_control.key_bindings = icon_kb
+
         for key, label, _required in fields:
             area = TextArea(
                 text=prefill.get(key, ""),
@@ -791,6 +1059,17 @@ class LocalhostMasterApp:
                     height=Dimension.exact(1),
                 )
             )
+            if key == "color":
+                # Icon sits directly under Color, matching the old field order.
+                rows.append(
+                    VSplit(
+                        [
+                            Label(" Icon".ljust(17), width=18, style="class:lm.field"),
+                            Window(self._icon_control, height=Dimension.exact(1)),
+                        ],
+                        height=Dimension.exact(1),
+                    )
+                )
 
         save_button = Button("Save", handler=self._save_form)
         cancel_button = Button("Cancel", handler=self._return_to_categories)
@@ -812,7 +1091,8 @@ class LocalhostMasterApp:
                     [
                         (
                             "class:lm.hint",
-                            " Tab/Up/Down: next field   Enter: next   Save: store   Esc: cancel\n"
+                            " Tab/Up/Down: next field   Enter: next   Icon field: Enter/Space chooses a preset"
+                            "   Save: store   Esc: cancel\n"
                             " Process globs / ports / protocols accept comma-separated values.",
                         )
                     ]
@@ -820,10 +1100,124 @@ class LocalhostMasterApp:
                 height=Dimension.exact(2),
             )
         )
-        self._switch_mode(FORM, HSplit(rows), focus=self._form_fields["name"])
+        self._form_root = HSplit(rows)
+        self._switch_mode(FORM, self._form_root, focus=self._form_fields["name"])
 
     def _return_to_categories(self) -> None:
         self._switch_mode(CATEGORIES, self._build_categories_root(), focus=self._category_control)
+
+    # ------------------------------------------------------------ icon picker
+    def _render_icon_field(self):
+        glyph = self._form_icon_glyph
+        if glyph and is_preset_glyph(glyph):
+            option = icon_by_glyph(glyph)
+            shown = render_glyph(glyph, self.ascii_only)
+            text = f" {shown}  {option.label}   [Enter/Space: choose]"
+        elif glyph:
+            shown = render_glyph(glyph, self.ascii_only) or LEGACY_ASCII_FALLBACK
+            text = f" {shown}  Legacy/custom   [Enter/Space: choose]"
+        else:
+            text = " (none)   [Enter/Space: choose]"
+        return [("class:lm.row", text)]
+
+    def _icon_picker_options(self) -> list[tuple[str, str]]:
+        """Return a list of (token, rendered label) including any legacy item."""
+        options: list[tuple[str, str]] = []
+        if self._form_icon_is_legacy and self._form_icon_glyph:
+            shown = render_glyph(self._form_icon_glyph, self.ascii_only) or LEGACY_ASCII_FALLBACK
+            options.append(("legacy", f"{shown}  Legacy/custom (keep current)"))
+        for option in preset_icons():
+            shown = render_glyph(option.glyph, self.ascii_only)
+            options.append((option.id, f"{shown}  {option.label}"))
+        return options
+
+    def _icon_picker_index_for(self, options: list[tuple[str, str]]) -> int:
+        glyph = self._form_icon_glyph
+        if self._form_icon_is_legacy:
+            for index, (token, _) in enumerate(options):
+                if token == "legacy":
+                    return index
+        if glyph:
+            option = icon_by_glyph(glyph)
+            if option is not None:
+                for index, (token, _) in enumerate(options):
+                    if token == option.id:
+                        return index
+        return 0
+
+    def _build_icon_picker_root(self):
+        options = self._icon_picker_options()
+        self._icon_picker_cursor = clamp_cursor(
+            self._icon_picker_index_for(options), len(options)
+        )
+        self._icon_control_picker = FormattedTextControl(
+            self._render_icon_picker, focusable=True, show_cursor=False
+        )
+        return HSplit(
+            [
+                Window(
+                    FormattedTextControl([("class:lm.header", " Select icon\n")]),
+                    height=1,
+                ),
+                Window(content=self._icon_control_picker, wrap_lines=False),
+            ]
+        )
+
+    def _render_icon_picker(self):
+        options = self._icon_picker_options()
+        lines = []
+        for index, (_token, label) in enumerate(options):
+            marker = "> " if index == self._icon_picker_cursor else "  "
+            style = "class:lm.selected" if index == self._icon_picker_cursor else "class:lm.row"
+            lines.append((style, f"{marker}{label}\n"))
+        lines.append(
+            (
+                "class:lm.hint",
+                " Up/Down or j/k: move   Enter/Space: choose   Esc: back to form",
+            )
+        )
+        return lines
+
+    def _open_icon_picker(self) -> None:
+        self._cancel_confirmations()
+        self._switch_mode(
+            ICON_PICKER,
+            self._build_icon_picker_root(),
+            focus=self._icon_control_picker,
+        )
+
+    def _icon_picker_move(self, delta: int) -> None:
+        options = self._icon_picker_options()
+        self._icon_picker_cursor = clamp_cursor(
+            self._icon_picker_cursor + delta, len(options)
+        )
+        self._invalidate()
+
+    def _icon_picker_move_to(self, index: int) -> None:
+        options = self._icon_picker_options()
+        self._icon_picker_cursor = clamp_cursor(index, len(options))
+        self._invalidate()
+
+    def _icon_picker_confirm(self) -> None:
+        options = self._icon_picker_options()
+        if 0 <= self._icon_picker_cursor < len(options):
+            token, _ = options[self._icon_picker_cursor]
+            if token == "legacy":
+                # Keep the existing legacy glyph untouched.
+                pass
+            else:
+                option = next((o for o in preset_icons() if o.id == token), None)
+                if option is not None:
+                    self._form_icon_glyph = option.glyph
+                    self._form_icon_is_legacy = False
+        self._return_to_form()
+
+    def _return_to_form(self) -> None:
+        form_root = getattr(self, "_form_root", None)
+        if form_root is None:
+            self._return_to_categories()
+            return
+        self._switch_mode(FORM, form_root, focus=self._icon_control)
 
     def _save_form(self) -> None:
         from ..models import CategoryRule
@@ -836,9 +1230,29 @@ class LocalhostMasterApp:
         if _has_control_chars(name):
             self._set_notice("Category name may not contain control characters", "error")
             return
+        icon = self._form_icon_glyph.strip()
+        if not icon:
+            self._set_notice("Icon is required; choose a preset icon", "error")
+            return
+        if _has_control_chars(icon) or len(icon) > 4:
+            self._set_notice("Icon must be a single preset glyph", "error")
+            return
+        if not is_preset_glyph(icon):
+            unchanged_legacy = (
+                self._editing_rule is not None
+                and self._form_icon_is_legacy
+                and icon == self._form_icon_original
+            )
+            if not unchanged_legacy:
+                self._set_notice("Choose an icon from the preset list", "error")
+                return
         scheme = values.get("scheme", "").strip().rstrip(":").lower()
         if scheme and scheme not in ("http", "https"):
             self._set_notice("Scheme must be http or https", "error")
+            return
+        color = values.get("color", "").strip()
+        if color and not is_valid_color(color):
+            self._set_notice("Color must be a name or #RRGGBB", "error")
             return
         try:
             priority = int(values.get("priority", "0") or "0")
@@ -859,19 +1273,27 @@ class LocalhostMasterApp:
             if proto not in ("TCP", "UDP"):
                 self._set_notice(f"Invalid protocol: {proto}", "error")
                 return
+        # An empty value keeps the default (openable); only an explicit
+        # false-ish value disables browser opening.
         open_in_browser = values.get("open_in_browser", "true").strip().lower() not in (
             "false",
             "no",
             "0",
-            "",
         )
         rule_id = self._editing_rule.id if self._editing_rule else _slug_rule_id(name)
+        if self._editing_rule is None and any(
+            r.id == rule_id for r in self.user_rules
+        ):
+            self._set_notice(
+                f"A category with id {rule_id!r} already exists; rename it", "error"
+            )
+            return
         preserved = _preserved_rule_fields(self._editing_rule)
         rule = CategoryRule(
             id=rule_id,
             name=name,
-            color=values.get("color", "").strip(),
-            icon=values.get("icon", "").strip(),
+            color=color,
+            icon=icon,
             priority=priority,
             process_globs=_split_csv(values.get("process_globs", "")),
             ports=ports,
@@ -884,7 +1306,8 @@ class LocalhostMasterApp:
         if self._editing_rule is not None:
             new_rules = [rule if r.id == rule_id else r for r in self.user_rules]
         else:
-            new_rules = [r for r in self.user_rules if r.id != rule_id] + [rule]
+            # Collisions were rejected above, so appending cannot overwrite.
+            new_rules = list(self.user_rules) + [rule]
         if self._commit_user_rules(new_rules):
             self._set_notice(f"Saved category {name}", "ok")
             self._trigger_refresh()
@@ -925,14 +1348,19 @@ class LocalhostMasterApp:
             event.app.exit()
 
         @kb.add("up", filter=Condition(table_active))
-        @kb.add("k", filter=Condition(table_active))
         def _up(event) -> None:
             app._move(-1)
 
         @kb.add("down", filter=Condition(table_active))
-        @kb.add("j", filter=Condition(table_active))
         def _down(event) -> None:
             app._move(1)
+
+        # Lower-case ``k`` on the main list means "force-stop": press twice.
+        # Main-list Vim ``j``/``k`` navigation was removed so ``k`` is
+        # unambiguous. Up/Down still move the cursor.
+        @kb.add("k", filter=Condition(table_active))
+        def _kill(event) -> None:
+            app._handle_kill()
 
         @kb.add("pageup", filter=Condition(table_active))
         def _pageup(event) -> None:
@@ -958,7 +1386,7 @@ class LocalhostMasterApp:
 
         @kb.add("escape", filter=Condition(table_active))
         def _escape_main(event) -> None:
-            app._cancel_arm()
+            app._cancel_confirmations()
             app.notice = None
             app._invalidate()
 
@@ -1054,6 +1482,53 @@ class LocalhostMasterApp:
         def _cat_close(event) -> None:
             app._return_to_main()
 
+        # Any unbound key cancels a pending delete confirmation, matching the
+        # on-screen hint. Specific bindings above still take priority.
+        @kb.add(Keys.Any, filter=Condition(category_active))
+        def _cat_any(event) -> None:
+            app._cancel_category_delete_confirm()
+
+        # Icon picker mode (inside the category form). ``k``/``j`` navigate the
+        # picker only; the mode condition keeps the main-list kill binding off.
+        def icon_picker_active():
+            return app.mode == ICON_PICKER
+
+        @kb.add("up", filter=Condition(icon_picker_active))
+        @kb.add("k", filter=Condition(icon_picker_active))
+        def _icon_up(event) -> None:
+            app._icon_picker_move(-1)
+
+        @kb.add("down", filter=Condition(icon_picker_active))
+        @kb.add("j", filter=Condition(icon_picker_active))
+        def _icon_down(event) -> None:
+            app._icon_picker_move(1)
+
+        @kb.add("pageup", filter=Condition(icon_picker_active))
+        def _icon_pageup(event) -> None:
+            app._icon_picker_move(-5)
+
+        @kb.add("pagedown", filter=Condition(icon_picker_active))
+        def _icon_pagedown(event) -> None:
+            app._icon_picker_move(5)
+
+        @kb.add("home", filter=Condition(icon_picker_active))
+        def _icon_home(event) -> None:
+            app._icon_picker_move_to(0)
+
+        @kb.add("end", filter=Condition(icon_picker_active))
+        def _icon_end(event) -> None:
+            app._icon_picker_move_to(len(app._icon_picker_options()) - 1)
+
+        @kb.add("enter", filter=Condition(icon_picker_active))
+        @kb.add("space", filter=Condition(icon_picker_active))
+        def _icon_choose(event) -> None:
+            app._icon_picker_confirm()
+
+        @kb.add("escape", filter=Condition(icon_picker_active))
+        @kb.add("c-c", filter=Condition(icon_picker_active))
+        def _icon_cancel(event) -> None:
+            app._return_to_form()
+
         return kb
 
 
@@ -1069,13 +1544,21 @@ def _parse_ports(value: str) -> list[int]:
             lo, hi = int(lo_s), int(hi_s)
             if lo > hi:
                 lo, hi = hi, lo
+            # Validate bounds BEFORE expanding, so a huge range cannot allocate
+            # millions of ints (or hang) before the error is raised.
+            _check_port(lo)
+            _check_port(hi)
             ports.extend(range(lo, hi + 1))
         else:
-            ports.append(int(part))
-    for port in ports:
-        if not (1 <= port <= 65535):
-            raise ValueError(f"port out of range: {port}")
+            port = int(part)
+            _check_port(port)
+            ports.append(port)
     return ports
+
+
+def _check_port(port: int) -> None:
+    if not (1 <= port <= 65535):
+        raise ValueError(f"port out of range: {port}")
 
 
 def _has_control_chars(text: str) -> bool:

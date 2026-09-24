@@ -63,6 +63,13 @@ class AppConfig:
             cfg.arm_guard_ms = max(0, int(cfg.arm_guard_ms))
         except (TypeError, ValueError):
             cfg.arm_guard_ms = 150
+        # A guard window that is not shorter than the confirmation window would
+        # make double-Enter (and double-k) impossible: every second press would
+        # fall inside the auto-repeat guard and be ignored. Clamp it to at most
+        # half the confirmation window so a usable confirmation period remains.
+        max_guard = cfg.double_enter_ms // 2
+        if cfg.arm_guard_ms > max_guard:
+            cfg.arm_guard_ms = max(0, max_guard)
         try:
             cfg.docker_ttl_s = max(1.0, float(cfg.docker_ttl_s))
         except (TypeError, ValueError):
@@ -143,6 +150,23 @@ def load_config(path: Optional[Path] = None) -> tuple[AppConfig, list[str]]:
         warnings.append(
             f"Config refresh_ms {cfg.refresh_ms} is below the minimum "
             f"{normalized.refresh_ms} ms; using {normalized.refresh_ms}"
+        )
+    if (
+        isinstance(cfg.arm_guard_ms, int)
+        and cfg.arm_guard_ms != normalized.arm_guard_ms
+    ):
+        warnings.append(
+            f"Config arm_guard_ms {cfg.arm_guard_ms} must be at most half of "
+            f"double_enter_ms {normalized.double_enter_ms}; using "
+            f"{normalized.arm_guard_ms}"
+        )
+    if (
+        isinstance(cfg.color_mode, str)
+        and cfg.color_mode not in VALID_COLOR_MODES
+    ):
+        warnings.append(
+            f"Config color_mode {cfg.color_mode!r} is not one of "
+            f"{', '.join(VALID_COLOR_MODES)}; using auto"
         )
     if (
         isinstance(cfg.docker_ttl_s, (int, float))

@@ -68,20 +68,25 @@ def build_parser() -> argparse.ArgumentParser:
 def setup_logging(debug: bool) -> Optional[Path]:
     if not debug:
         return None
-    log_dir = default_log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "localhostmaster.log"
-    handler = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=512 * 1024, backupCount=3, encoding="utf-8"
-    )
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    root = logging.getLogger("localhostmaster")
-    root.setLevel(logging.DEBUG)
-    root.handlers = [handler]
-    root.propagate = False
-    return log_path
+    try:
+        log_dir = default_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "localhostmaster.log"
+        handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=512 * 1024, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root = logging.getLogger("localhostmaster")
+        root.setLevel(logging.DEBUG)
+        root.handlers = [handler]
+        root.propagate = False
+        return log_path
+    except OSError:
+        # A bad/unwritable %LOCALAPPDATA% must not stop the app; degrade to no
+        # file logging.
+        return None
 
 
 def _json_record(entry) -> dict:
@@ -192,6 +197,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     if interactive:
+        from .process_terminator import ProcessTerminator
         from .tui.application import LocalhostMasterApp
 
         app = LocalhostMasterApp(
@@ -205,6 +211,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             user_rules=classifier.user_rules,
             warnings=warnings,
             no_color=args.no_color,
+            terminator=ProcessTerminator(),
         )
         if docker.enabled:
             docker.start()

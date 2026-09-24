@@ -31,6 +31,10 @@ def build_snapshot(
 ) -> Snapshot:
     now = time.monotonic() if now is None else now
     previous_first_seen = previous_first_seen or {}
+    # Materialise the input so a caller may pass any iterable (including a
+    # generator) without it being consumed by ``begin_scan_endpoints`` and the
+    # scan loop below.
+    raw_endpoints = list(raw_endpoints)
 
     process_cache: dict[int, object] = {}
     entries: list[PortEntry] = []
@@ -98,6 +102,9 @@ class RefreshWorker:
         self._paused = False
         self._stop = threading.Event()
         self._wake = threading.Event()
+        # A manual trigger (``r`` / ``a`` / post-kill refresh) must scan even
+        # while auto-refresh is paused, unlike a plain interval wake-up.
+        self._manual = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -107,6 +114,7 @@ class RefreshWorker:
         # Allow a stopped worker to be restarted.
         self._stop.clear()
         self._wake.clear()
+        self._manual.clear()
         self._thread = threading.Thread(target=self._loop, name="lm-refresh", daemon=True)
         self._thread.start()
 
@@ -119,6 +127,8 @@ class RefreshWorker:
         self._thread = None
 
     def trigger(self) -> None:
+        # Manual: bypass the pause guard in ``_loop``.
+        self._manual.set()
         self._wake.set()
 
     def pause(self) -> None:
@@ -156,7 +166,9 @@ class RefreshWorker:
             self._wake.clear()
             if self._stop.is_set():
                 break
-            if self._paused:
+            manual = self._manual.is_set()
+            self._manual.clear()
+            if self._paused and not manual:
                 continue
             snapshot = self._scan()
             if snapshot is not None and self._on_snapshot is not None:

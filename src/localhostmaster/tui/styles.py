@@ -8,14 +8,36 @@ from typing import Iterable, Optional
 
 from prompt_toolkit.output.color_depth import ColorDepth
 from prompt_toolkit.styles import Style
+from prompt_toolkit.styles.style import parse_color
 
+from ..icons import ascii_fallback_for_glyph
 from ..models import CategoryAssignment, CategoryRule
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 DEFAULT_CATEGORY_COLOR = "#9CA3AF"
 
-# ASCII fallbacks for the unicode icons used by builtin categories.
+
+def is_valid_color(value: Optional[str]) -> bool:
+    """Whether ``value`` is a colour prompt_toolkit can parse.
+
+    prompt_toolkit accepts named colours (``red``, ``ansired``), ``#RGB`` and
+    ``#RRGGBB``. Anything else makes ``Style.from_dict`` raise, which would stop
+    the TUI from starting, so it must be rejected up front.
+    """
+    if not value:
+        return False
+    try:
+        parse_color(value.strip())
+        return True
+    except Exception:
+        return False
+
+
+# Compatibility ASCII labels for the builtin categories. These are more
+# readable than a single glyph fallback ("DB"/"dev"/"sys"), so they take
+# precedence for those known names; everything else goes through the central
+# icon registry, and unknown legacy glyphs fall back to "*".
 ASCII_ICONS = {
     "llama.cpp": "L",
     "docker": "D",
@@ -67,10 +89,24 @@ def category_label(
         return "unknown"
     icon = assignment.icon
     if ascii_only:
-        icon = ASCII_ICONS.get(assignment.name, "")
+        icon = _ascii_icon(assignment)
     if icon:
         return f"{icon} {assignment.name}"
     return assignment.name
+
+
+def _ascii_icon(assignment: CategoryAssignment) -> str:
+    """Resolve the ASCII-only icon for an assignment.
+
+    Known builtin names keep their readable label; otherwise the central icon
+    registry is consulted by glyph, and an unknown legacy glyph becomes ``*``.
+    """
+    known = ASCII_ICONS.get(assignment.name)
+    if known is not None:
+        return known
+    if assignment.icon:
+        return ascii_fallback_for_glyph(assignment.icon)
+    return ""
 
 
 def base_style_dict(color_mode: str) -> dict[str, str]:
@@ -106,6 +142,10 @@ def build_style_dict(
     if color_mode != "none":
         for rule in rules:
             color = rule.color or DEFAULT_CATEGORY_COLOR
+            if not is_valid_color(color):
+                # Never let a hand-written bad colour brick the UI: fall back
+                # to the default instead of raising from Style.from_dict.
+                color = DEFAULT_CATEGORY_COLOR
             style_dict[category_style_name(rule.name)] = f"fg:{color}"
     return style_dict
 

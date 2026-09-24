@@ -16,6 +16,13 @@ from typing import Optional
 ARM_GUARD_S = 0.150
 ARM_TIMEOUT_S = 2.500
 
+# Double-``k`` force-stop tuning constants (seconds). Deliberately fixed, not
+# user-configurable: this is a destructive action and must stay predictable.
+KILL_GUARD_S = 0.150
+KILL_TIMEOUT_S = 2.500
+# How long the terminator waits for the process to actually exit after kill().
+KILL_WAIT_S = 1.5
+
 
 class Protocol(str, enum.Enum):
     TCP = "TCP"
@@ -78,6 +85,25 @@ class EndpointKey:
             self.remote_address,
             self.remote_port,
         )
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Everything needed to safely identify a kill target across two ``k``.
+
+    A bare PID is never enough: a PID can be recycled between the first and the
+    second ``k``. The (pid, create_time) pair is the same identity tuple psutil
+    itself uses, and ``endpoint_key`` ties the target to the row the user
+    selected. ``process_name`` is for display only.
+    """
+
+    pid: int
+    create_time: float
+    endpoint_key: EndpointKey
+    process_name: str = ""
+    # True when the host endpoint has a Docker container mapping attached.
+    # Part of the identity so a mapping change between the two ``k`` cancels.
+    has_container_mapping: bool = False
 
 
 @dataclass
@@ -236,6 +262,18 @@ class ContainerEndpoint:
 class ArmedOpenState:
     endpoint_key: EndpointKey
     url: str
+    armed_at: float
+    accept_after: float
+    expires_at: float
+
+    def is_expired(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        return now > self.expires_at
+
+
+@dataclass
+class ArmedKillState:
+    target: ProcessIdentity
     armed_at: float
     accept_after: float
     expires_at: float

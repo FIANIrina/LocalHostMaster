@@ -15,25 +15,51 @@ COLUMNS: list[tuple[str, str, int, str]] = [
     ("remote", "REMOTE", 22, "left"),
     ("port", "PORT", 5, "right"),
     ("pid", "PID", 7, "right"),
-    ("process", "PROCESS", 22, "left"),
+    ("process", "PROCESS", 21, "left"),
     ("container", "CONTAINER", 18, "left"),
     ("category", "CATEGORY", 15, "left"),
     ("open", "OPEN", 5, "left"),
 ]
 
-WIDE_COLUMNS = ["proto", "address", "port", "pid", "process", "container", "category", "open"]
-MEDIUM_COLUMNS = ["proto", "address", "port", "process", "category"]
-NARROW_COLUMNS = ["proto", "port", "process", "category"]
+# Columns are selected by width budget rather than fixed tiers, so a column
+# (notably OPEN) is never shown in the list yet clipped off the right edge
+# because a hard threshold was crossed. Order = most useful first.
+_MIN_TERMINAL_WIDTH = 40
+_COLUMN_PRIORITY = [
+    "proto",
+    "port",
+    "process",
+    "open",
+    "category",
+    "address",
+    "pid",
+    "container",
+]
+# ``remote`` only appears when connected rows are shown, and then it must be
+# budgeted for like any other column (it is wide, so it lands near the end).
+_REMOTE = "remote"
+_COLUMN_WIDTH = {key: width for key, _title, width, _align in COLUMNS}
 
 
-def select_columns(width: int) -> list[str]:
-    if width >= 100:
-        return WIDE_COLUMNS
-    if width >= 70:
-        return MEDIUM_COLUMNS
-    if width >= 40:
-        return NARROW_COLUMNS
-    return []
+def select_columns(width: int, show_remote: bool = False) -> list[str]:
+    if width < _MIN_TERMINAL_WIDTH:
+        return []
+    priority = list(_COLUMN_PRIORITY)
+    if show_remote and _REMOTE not in priority:
+        # Before ``container`` so a connected peer is visible in reasonably
+        # wide layouts, but only when it actually fits.
+        priority.insert(priority.index("container"), _REMOTE)
+    chosen: set[str] = set()
+    total = 0
+    for key in priority:
+        addition = _COLUMN_WIDTH[key] + (1 if chosen else 0)  # 1-cell separator
+        if total + addition > width:
+            # Skip this one; a narrower lower-priority column may still fit.
+            continue
+        chosen.add(key)
+        total += addition
+    # Return in canonical display order (COLUMNS order).
+    return [key for key, _title, _width, _align in COLUMNS if key in chosen]
 
 
 def truncate(text: str, width: int) -> str:
@@ -88,15 +114,11 @@ def build_table(
     ascii_only: bool = False,
     show_remote: bool = False,
 ) -> list[tuple[str, str]]:
-    columns = select_columns(width)
-    # The remote column is wide-screen only and appears only while connected
-    # rows are being shown. Narrow layouts omit it, but entry identity still
-    # carries the remote endpoint.
-    if show_remote and "pid" in columns:
-        columns = [c for c in columns if c != "remote"]
-        index = columns.index("address") + 1
-        columns = columns[:index] + ["remote"] + columns[index:]
-    selected_columns = [c for c in COLUMNS if c[0] in columns]
+    # Column selection already budgets for the remote column when it is shown,
+    # so rows are guaranteed to fit and remote never depends on another column
+    # being present.
+    keys = select_columns(width, show_remote=show_remote)
+    selected_columns = [c for c in COLUMNS if c[0] in keys]
 
     if not selected_columns:
         return [

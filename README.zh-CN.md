@@ -78,10 +78,11 @@ python -m venv .venv
 
 | 按键 | 操作 |
 | --- | --- |
-| `Up`/`Down`、`j`/`k` | 移动光标 |
+| `Up`/`Down` | 移动光标 |
 | `PageUp`/`PageDown` | 翻页 |
 | `Home`/`End` | 跳到首行 / 末行 |
 | `Enter` | 预备；2.5 秒内再次按下则在浏览器中打开 |
+| `k` | 预备强制关闭；2.5 秒内再次按下则终止进程 |
 | `Esc` | 取消确认 / 关闭对话框 |
 | `r` | 立即刷新 |
 | `Space` | 暂停 / 恢复自动刷新 |
@@ -94,6 +95,9 @@ python -m venv .venv
 | `?` | 帮助 |
 | `q`、`Ctrl-C` | 退出 |
 
+`j`/`k` 仍可在过滤、分类和图标选择列表中作为局部导航键使用；主端口列表只使用
+`Up`/`Down`，因此主列表中的 `k` 含义明确、不会被导航占用。
+
 ### 双击 Enter
 
 1. 第一次 `Enter` 只是**预备**（arm）选中端点；状态栏显示
@@ -104,7 +108,34 @@ python -m venv .venv
 
 只有 TCP **LISTEN** 端点可以被打开。已连接的 TCP 行（ESTABLISHED、TIME_WAIT、
 CLOSE_WAIT 等）与 UDP 行在 OPEN 列显示 `-`，永远不会进入预备状态；对这些行按
-`Enter` 只会说明为何无法打开。
+`Enter` 只会说明为何无法打开。表格会根据终端宽度自适应选列：在常见的中等/宽终端
+上会显示 OPEN 列，只有极窄的终端才会省略 OPEN（以及其他列）。
+
+### 双击 `k` 强制关闭
+
+第一次 `k` 只是**预备**选中端点；状态栏显示
+`Press k again within 2.5s to force-stop …`。在 150 毫秒到 2500 毫秒之间的
+第二次 `k` 会提交终止。前 150 毫秒内的按键（键盘自动重复）会被忽略；超过
+2.5 秒后再按 `k` 会作为一次新的确认。
+
+安全规则：
+
+- 终止的是该行对应的**整个宿主机进程**，而不是单个 socket。该进程占用的
+  其他端口会一并消失，状态栏会提示可能影响的可见端点数。
+- 不终止进程树、不递归终止子进程、不自动提权。只使用
+  `psutil.Process(pid).kill()`，不调用 shell、PowerShell、`taskkill` 或
+  `Stop-Process`。
+- 只允许对 **TCP LISTEN** 与 **UDP BOUND** 行发起；已连接的 TCP 行
+  （ESTABLISHED、TIME_WAIT 等）以及没有 PID 的行会被拒绝。
+- 在真正终止前会再次校验进程身份（`PID` + 创建时间 + 端点），因此被复用的
+  PID 不会被误杀；同时会重新扫描确认该端点仍属于同一 PID 且仍在监听。
+- LocalhostMaster 自身、PID 0、PID 4、Windows 核心/服务进程以及 Docker 宿主
+  代理（`com.docker.backend`、`wslrelay`、`dockerd`、`docker`）始终被拒绝。
+- 无法读取 `create_time` 时默认拒绝，而不是在未验证身份的情况下终止。
+- 终止在后台线程执行，界面不会卡顿，完成后立即刷新端口列表。
+- 结果会区分**已退出**与**请求已发送但退出未确认**
+  （`Force-stop was requested, but exit was not confirmed.`）。
+  `AccessDenied` 属于正常的权限限制，不是缺陷。
 
 ## URL 规则
 
@@ -147,7 +178,9 @@ arm_guard_ms = 150
 
 `refresh_ms` 会被钳制到最小 250 毫秒（并给出警告），因此错误的配置不会造成忙循环；
 `--refresh-ms` 小于 250 会被直接拒绝并报错。`docker_timeout_s` 与 `docker_ttl_s`
-同样会被钳制为正值。
+同样会被钳制为正值。`arm_guard_ms` 会被钳制为不超过 `double_enter_ms` 的一半
+（并给出警告），否则防连发窗口会吞掉每一次第二次按键，导致双击 Enter / 双击 `k`
+永远无法触发。未知的 `color_mode` 会回退为 `auto` 并给出警告。
 
 ### `categories.toml`
 
@@ -159,7 +192,7 @@ arm_guard_ms = 150
 id = "user.my-llama"
 name = "my-llama"
 color = "#7C3AED"
-icon = "L"
+icon = "◆"
 priority = 120
 open_in_browser = true
 scheme = "http"
@@ -174,6 +207,9 @@ ports = [3000]
 port_ranges = ["3001-3010"]
 protocols = ["TCP"]
 ```
+
+`icon` 在界面中从预设图标列表选择（见下文 **分类图标**），并以实际字形保存。
+文件格式保持不变，手写的 `icon` 值仍然可用。
 
 匹配规则：
 
@@ -202,6 +238,26 @@ protocols = ["TCP"]
 分类始终以**文本**显示；颜色从不是唯一信号。在 `none` / `NO_COLOR` / `--no-color`
 模式下，Unicode 图标会回退为 ASCII。
 
+## 分类图标
+
+分类表单不再接受自由文本图标输入。**Icon** 字段是只读选择器：按 `Enter` 或
+`Space` 打开选择器，列表中的每一项都直接展示实际字形与可读名称（例如
+`◆  Diamond`）。`Up`/`Down`（或 `j`/`k`）移动，`Enter`/`Space` 选择，`Esc`
+返回表单且不改变任何内容。
+
+- 新建与编辑的分类必须使用预设图标；默认为 `◆ Diamond`。
+- 预设均为单宽度符号，在 Windows Terminal 中显示稳定：
+  `◆`、`▣`、`▤`、`▸`、`•`、`·`、`●`、`■`、`▲`、`★`、`◇`、`□`、`○`、`◉`、`⬢`、`✦`。
+- 只有在**保存**整个分类表单时，选中的字形才会写入 `categories.toml`；
+  取消表单不会产生任何写入。
+- 既有手写图标继续可用。不在预设列表中的图标在表单中显示为
+  `Legacy/custom`，除非用户主动选择预设，否则会被保留；在 ASCII-only 模式下
+  回退为 `*`。未知字形不会导致加载失败。
+
+**Color** 字段必须是 prompt_toolkit 支持的颜色名（如 `red`、`ansiblue`）或
+`#RGB`/`#RRGGBB`。非法取值会被表单拒绝；磁盘上已有的非法颜色也不会阻止界面启动
+（会回退为默认灰色）。
+
 ## 权限
 
 - 以普通用户身份即可运行，无需提权。
@@ -229,7 +285,8 @@ python -m compileall src
 ```
 
 测试使用依赖注入与替身（fake）：它们从不打开真实浏览器，也只在随机端口上绑定
-临时的回环 socket。
+临时的回环 socket。强制关闭使用注入的 fake terminator 测试，因此
+**任何自动化测试都不会终止真实进程**。
 
 ## 性能
 
@@ -261,6 +318,10 @@ python -m compileall src
 - 已连接的 TCP 行与 UDP 端点无法打开。
 - PID 身份约每 45 秒重新验证一次（并在 PID 的端点集合变化时立即验证）；
   若某进程在两次验证之间被杀掉、且其 PID 恰好被回收，仍可能短暂显示陈旧元数据。
+- 强制关闭无法做到原子：会在终止前立即重新校验端点与身份，这能缩小但无法完全
+  消除“校验”与 `TerminateProcess` 之间的窗口。
+- Docker 宿主代理被刻意禁止终止，因此无法从 LocalhostMaster 关闭容器的发布端口
+  （请使用 `docker stop`）。
 - 默认不产出独立的 `.exe`（未安装、也不要求打包工具）。
 
 ## 项目结构
@@ -279,8 +340,11 @@ src/localhostmaster/
   clipboard.py           Win32 Unicode 剪贴板
   refresh.py             快照构建 + 后台刷新工作线程
   state.py               双击 Enter 状态机、排序/过滤/选择
+  kill_state.py          双击 k 强制关闭状态机
+  process_terminator.py  安全的 psutil 终止边界（策略 + 二次校验）
+  icons.py               中央预设图标注册表
   tui/                   prompt_toolkit 应用、控件、样式
-tests/                   unittest 测试套件（使用替身，不触碰真实浏览器/终端）
+tests/                   unittest 测试套件（使用替身，不触碰真实浏览器/终端/进程）
 ```
 
 ## 许可证
